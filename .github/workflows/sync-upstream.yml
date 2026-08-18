@@ -1,0 +1,78 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      SOURCE: izeberg/wot-src
+    steps:
+      - name: Ensure label exists
+        run: gh label create sync-report --repo "$REPO" --color 0e8a16 --description "Automated upstream sync report" 2>/dev/null || true
+
+      - name: Sync every branch and collect a change report
+        run: |
+          set -euo pipefail
+          BRANCHES="EU NA ASIA CN CT PT_RU RU"
+          REPORT_FILE="$(mktemp)"
+          CHANGED=0
+
+          for BRANCH in $BRANCHES; do
+            OLD_SHA="$(gh api "repos/$REPO/branches/$BRANCH" --jq .commit.sha 2>/dev/null || echo "")"
+
+            gh repo sync "$REPO" --source "$SOURCE" --branch "$BRANCH" --force
+
+            NEW_SHA="$(gh api "repos/$REPO/branches/$BRANCH" --jq .commit.sha)"
+
+            if [ -n "$OLD_SHA" ] && [ "$OLD_SHA" != "$NEW_SHA" ]; then
+              CHANGED=1
+              COMPARE_JSON="$(gh api "repos/$REPO/compare/$OLD_SHA...$NEW_SHA")"
+              AHEAD="$(echo "$COMPARE_JSON" | jq -r '.ahead_by')"
+              FILE_COUNT="$(echo "$COMPARE_JSON" | jq -r '.files | length')"
+
+              {
+                echo "### $BRANCH: $AHEAD commit(s), $FILE_COUNT file(s) changed"
+                echo
+                echo "[Compare on GitHub](https://github.com/$REPO/compare/$OLD_SHA...$NEW_SHA)"
+                echo
+                echo "<details><summary>Changed files</summary>"
+                echo
+                echo '```'
+                echo "$COMPARE_JSON" | jq -r '.files[]?.filename' | head -300
+                if [ "$FILE_COUNT" -gt 300 ]; then
+                  echo "... ($((FILE_COUNT - 300)) more, see full compare link above)"
+                fi
+                echo '```'
+                echo "</details>"
+                echo
+                echo "<details><summary>Commit messages</summary>"
+                echo
+                echo '```'
+                echo "$COMPARE_JSON" | jq -r '.commits[]?.commit.message' | head -30
+                echo '```'
+                echo "</details>"
+                echo
+              } >> "$REPORT_FILE"
+            fi
+          done
+
+          echo "CHANGED=$CHANGED" >> "$GITHUB_ENV"
+          cp "$REPORT_FILE" /tmp/sync-report.md
+
+      - name: Open a report issue if anything changed
+        if: env.CHANGED == '1'
+        run: |
+          gh issue create --repo "$REPO" \
+            --title "Upstream sync: changes $(date -u +'%Y-%m-%d %H:%M') UTC" \
+            --body-file /tmp/sync-report.md \
+            --label sync-report
